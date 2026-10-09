@@ -17,7 +17,6 @@ import (
 )
 
 type taskIDContextKey struct{}
-type workerContextKey struct{}
 
 // WithTaskID attaches the owning task registry id to an LLM call. Session ids
 // are based on exploration ids, which are not interchangeable with task ids.
@@ -38,37 +37,15 @@ func TaskIDFrom(ctx context.Context) string {
 	return strings.TrimSpace(taskID)
 }
 
-// WithWorker overrides the agent-lane ("worker") label for an LLM call. The lane
-// is normally parsed from the transcript session id (exp<N>-<role>); calls made
-// outside the engine's worker/planner sessions — e.g. the intercept fallback judge
-// — carry no such session, so they attach their lane explicitly here. This lets the
-// usage ledger single out that spend (worker='judge') for the config page.
-func WithWorker(ctx context.Context, worker string) context.Context {
-	worker = strings.TrimSpace(worker)
-	if worker == "" {
-		return ctx
-	}
-	return context.WithValue(ctx, workerContextKey{}, worker)
-}
-
-// workerFrom returns the explicit lane override, or "" when none is set.
-func workerFrom(ctx context.Context) string {
-	if ctx == nil {
-		return ""
-	}
-	worker, _ := ctx.Value(workerContextKey{}).(string)
-	return strings.TrimSpace(worker)
-}
-
 // Recorder wraps an llm.Provider and records every completion call.
 type Recorder struct {
 	inner llm.Provider
 	pg    *db.DB
 	model string // model name (from config, not in CompletionRequest)
 	prof  string // LLM profile name (from llm_profiles)
-	// thinkingType / reasoningEffort 是配置级思考参数(思考开关 / 思考强度)。它们在
-	// norma 的 buildBody() 里从 provider 配置注入真正的 HTTP body,不出现在
-	// CompletionRequest 上,故 Recorder 需在此单独带一份,序列化时写进录制。
+	// thinkingType / reasoningEffort are provider-level reasoning settings.
+	// norma buildBody injects them into the HTTP body, not CompletionRequest,
+	// so Recorder keeps a separate copy for serialization.
 	thinkingType    string
 	reasoningEffort string
 	enabled         func() bool // reports whether recording is currently on; nil = always record
@@ -124,9 +101,6 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 	start := time.Now()
 	session := transcript.SessionIDFrom(ctx)
 	parsedID, worker := parseSession(session)
-	if ov := workerFrom(ctx); ov != "" {
-		worker = ov
-	}
 	expID := db.ParseExpID(parsedID)
 	taskID := TaskIDFrom(ctx)
 	if taskID == "" {
@@ -224,9 +198,6 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	start := time.Now()
 	session := transcript.SessionIDFrom(ctx)
 	parsedID, worker := parseSession(session)
-	if ov := workerFrom(ctx); ov != "" {
-		worker = ov
-	}
 	expID := db.ParseExpID(parsedID)
 	taskID := TaskIDFrom(ctx)
 	if taskID == "" {
@@ -358,9 +329,9 @@ func (r *Recorder) serializeRequest(req llm.CompletionRequest) string {
 		"messages":   req.Messages,
 		"max_tokens": req.MaxTokens,
 	}
-	// 记录本次调用实际发出的思考参数。type 采用「有效值」：每请求覆盖 req.Thinking
-	// 优先于配置级 thinkingType(与 norma buildBody 的判定一致，如 compaction 摘要会
-	// 强制 disabled)；effort 无每请求覆盖，直接取配置值。两者皆空则不写 thinking 字段。
+	// Record effective reasoning settings. Per-request req.Thinking overrides
+	// the provider thinkingType, matching norma buildBody (compaction summaries
+	// force disabled). Effort comes from config. Omit thinking when both are empty.
 	effType := r.thinkingType
 	if req.Thinking != "" {
 		effType = req.Thinking
